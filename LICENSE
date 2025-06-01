@@ -1,21 +1,32 @@
-MIT License
+Business Source License 1.1
 
-Copyright (c) 2024 Ryuki Horita
+Portions Copyright (c) 2024 kamome <h.ryuki0817@gmail.com>
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+The Business Source License (this "License") is a Change Model License that sets forth
+the terms under which the Licensed Work (as defined below) may be used and distributed.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Definitions.
+   "Licensed Work" means the computer software distributed by kamome with this License.
+   "Change Date" means January 1, 2029.
+   "Change License" means the MIT License.
+   "Additional Use Grant" means that the Licensed Work may be used for personal, non-commercial purposes without restriction.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. Usage.
+   The Licensed Work may be used, copied, distributed, and modified, except that:
+   (a) it may not be used in a production system or service where the primary purpose is to provide the functionality of the Licensed Work to third parties;
+   (b) it may not be used by any entity that provides a product or service that competes with a product or service provided by kamome that incorporates the Licensed Work;
+   (c) it may not be used in any other commercial production environment without a separate commercial license from kamome.
+
+   Notwithstanding the above, the "Additional Use Grant" specified in Section 1 permits unrestricted use for personal, non-commercial purposes.
+
+3. Change Date and Change License.
+   On the Change Date, the Licensed Work will become available under the Change License.
+
+4. Other Terms.
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
