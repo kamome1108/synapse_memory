@@ -1,0 +1,31 @@
+# .gitignore
+# Python
+__pycache__/
+*.pyc
+*.o
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+synapse_chroma_db/ # ChromaDB data directory
+
+# pip
+*.egg-info/
+.installed.egg
+/build/
+/dist/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+.Trash
+Thumbs.db
