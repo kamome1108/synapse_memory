@@ -103,6 +103,3 @@ pytest tests/
 Contributing and Participating in Self-Development
 
 This project embodies the challenging aspect of AI self-development. If you resonate with this vision and wish to contribute, please feel free to engage via GitHub Issues or Pull Requests. Observing how the AI agent interprets your feedback and integrates it into its development plan is one of the unique aspects of this project.
-License
-
-This project is licensed under the MIT License. See the LICENSE file for details.
