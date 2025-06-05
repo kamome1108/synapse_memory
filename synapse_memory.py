@@ -1,467 +1,590 @@
-import sqlite3
+"""
+SynapseMemory: Human-like long-term and short-term memory for LLM chatbots.
+Includes skip, sleep (with user notification), approximate k-NN graph, summary-vector cache,
+and a unified handle_message entry point.
+"""
+
 import os
-import json
-from datetime import datetime
-from typing import List, Dict, Optional
+import sqlite3
+import threading
+import datetime
 import numpy as np
+import faiss
+import networkx as nx
+import yaml
+
 from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.utils import embedding_functions
+from datetime import datetime as dt
+import re  # for robust number extraction from LLM response
 
-# 環境変数からAPIキーを読み込むか、直接設定
-# API_KEY = os.getenv("YOUR_LLM_API_KEY") # 実際のAPIキーに置き換える
-
-class Experience:
-    """記憶の最小単位となる経験クラス"""
-    def __init__(self, id: Optional[int], timestamp: str, content: str,
-                 source_type: str, metadata: Dict, importance: float, processed: bool):
-        self.id = id
-        self.timestamp = timestamp
-        self.content = content
-        self.source_type = source_type
-        self.metadata = metadata if isinstance(metadata, dict) else json.loads(metadata)
-        self.importance = importance
-        self.processed = processed
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "timestamp": self.timestamp,
-            "content": self.content,
-            "source_type": self.source_type,
-            "metadata": json.dumps(self.metadata),
-            "importance": self.importance,
-            "processed": self.processed
-        }
-
-class MemoryNode:
-    """原子ノード（記憶から抽出された重要な概念や事実）"""
-    def __init__(self, id: Optional[int], experience_id: int, text: str,
-                 node_type: str, importance: float, access_count: int, last_accessed: str):
-        self.id = id
-        self.experience_id = experience_id
-        self.text = text
-        self.node_type = node_type
-        self.importance = importance
-        self.access_count = access_count
-        self.last_accessed = last_accessed
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "experience_id": self.experience_id,
-            "text": self.text,
-            "node_type": self.node_type,
-            "importance": self.importance,
-            "access_count": self.access_count,
-            "last_accessed": self.last_accessed
-        }
 
 class SynapseMemory:
-    """
-    Synapse記憶システムの中核クラス。
-    長期記憶（SQLite）と短期記憶（ChromaDB）を管理。
-    """
-    def __init__(self, db_path: str = "synapse_memory.db",
-                 chroma_path: str = "synapse_chroma_db",
-                 embedding_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2',
-                 debug: bool = False):
-        self.db_path = db_path
-        self.chroma_path = chroma_path
-        self.embedding_model_name = embedding_model_name
-        self.debug = debug
-        self.connection = None
-        self.chroma_client = None
-        self.embedding_function = None
-        self.chroma_collection = None
+    """Integrates long-term and short-term memory with human-like recall."""
 
-        self._initialize_components()
-        self.init_db() # コンストラクタでDB初期化を呼び出す
+    def __init__(self, config_path: str = "sm_config.yaml", llm_callback=None):
+        # ==== CONFIGURATION ====
+        if not os.path.exists(config_path):
+            default_conf = {
+                "embedding_model": "all-MiniLM-L6-v2",
+                "faiss_top_k_embed": 30,
+                "graph_sim_threshold": 0.7,
+                "graph_nn_k": 10,
+                "scoring_weights": {
+                    "sim_score": 0.35,
+                    "context_score": 0.15,
+                    "recency_score": 0.15,
+                    "imp_score": 0.10,
+                    "freq_score": 0.10,
+                    "centrality_score": 0.15
+                },
+                "context_window_pairs": 6,
+                "db": {"type": "sqlite", "sqlite_path": "memory.db"},
+                "sleep": {"n_clusters": 6, "semantic_threshold": 0.85, "time_window_sec": 600}
+            }
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(default_conf, f)
 
-    def _initialize_components(self):
-        """EmbeddingモデルとChromaDBクライアントの初期化"""
-        if self.debug:
-            print(f"Initializing embedding model: {self.embedding_model_name}")
+        with open(config_path, "r", encoding="utf-8") as f:
+            conf = yaml.safe_load(f)
+
+        self.embedding_model_name = conf.get("embedding_model", "")
+        self.faiss_top_k_embed = int(conf.get("faiss_top_k_embed", 30))
+        self.graph_sim_threshold = float(conf.get("graph_sim_threshold", 0.7))
+        self.graph_nn_k = int(conf.get("graph_nn_k", 10))
+        self.scoring_weights = conf.get("scoring_weights", {})
+        self.context_window_pairs = int(conf.get("context_window_pairs", 6))
+
+        db_conf = conf.get("db", {})
+        self.db_path = db_conf.get("sqlite_path", "memory.db")
+
+        sleep_conf = conf.get("sleep", {})
+        self.sleep_n_clusters = int(sleep_conf.get("n_clusters", 6))
+        self.sleep_semantic_threshold = float(sleep_conf.get("semantic_threshold", 0.85))
+        self.sleep_time_window = int(sleep_conf.get("time_window_sec", 600))
+
+        # ==== LLM CALLBACK ====
+        self._llm_callback = llm_callback
+
+        # ==== EMBEDDING & INDEX ====
         try:
-            self.embedding_model = SentenceTransformer(self.embedding_model_name)
-            self.embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name=self.embedding_model_name
-            )
-            if self.debug:
-                print("Embedding model loaded.")
+            self.embedder = SentenceTransformer(self.embedding_model_name)
         except Exception as e:
-            if self.debug:
-                print(f"Error loading embedding model: {e}")
-            raise # モデルロードに失敗したら例外を再スロー
+            raise RuntimeError(f"Failed to load embedding model: {e}")
+        self.index = None
+        self._thread_local = threading.local()
 
-        if self.debug:
-            print(f"Initializing ChromaDB client at: {self.chroma_path}")
+        # ==== GRAPH & CACHE ====
+        self.graph = nx.Graph()
+        self.centrality_scores = {}
+        self.summary_embeddings = {}  # id -> embedding vector
+        self.summary_norms = {}       # id -> normalized embedding
+
+        # ==== SETUP DATABASE & INDEX ====
+        conn_main = sqlite3.connect(self.db_path, timeout=30)
+        self._ensure_tables_exist(conn_main)
+        conn_main.close()
+
+        self._load_faiss_index_if_exists()
+        self._build_graph_and_centrality()
+
+    def _get_connection(self):
+        """Return a thread-local SQLite connection."""
+        if not hasattr(self._thread_local, "conn"):
+            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            self._thread_local.conn = conn
+        return self._thread_local.conn
+
+    def _ensure_tables_exist(self, conn):
+        """Create required tables if they do not exist."""
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS experiences (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                title            TEXT,
+                title_embedding  BLOB,
+                content          TEXT,
+                summary_text     TEXT,
+                timestamp        TEXT,
+                importance       REAL DEFAULT 1.0,
+                processed        INTEGER DEFAULT 1,
+                recall_count     INTEGER DEFAULT 0
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memory_cluster (
+                cluster_id      INTEGER,
+                experience_id   INTEGER,
+                cluster_label   TEXT
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS experience_relations (
+                exp_id_a      INTEGER,
+                exp_id_b      INTEGER,
+                relation_type TEXT
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sleep_history (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_start      TEXT,
+                cycle_end        TEXT,
+                original_count   INTEGER,
+                summary_text     TEXT,
+                notes            TEXT
+            );
+        """)
+        conn.commit()
+
+    @property
+    def index_file(self):
+        """Path to FAISS index file."""
+        return os.path.splitext(self.db_path)[0] + "_index.faiss"
+
+    def _load_faiss_index_if_exists(self):
+        """Load existing FAISS index if present."""
+        if os.path.exists(self.index_file):
+            try:
+                self.index = faiss.read_index(self.index_file)
+            except Exception:
+                self.index = None
+
+    def add_experience(self, title: str, content: str, summary_text: str,
+                       importance: float = 1.0, processed: int = 1) -> int:
+        """
+        Insert a new experience: generate embedding, store in DB, update FAISS and graph.
+        Returns the new experience ID.
+        """
+        conn = self._get_connection()
+        cur = conn.cursor()
+
+        # Embed content (use same vector for title_embedding)
+        vec = self.embedder.encode(content).astype("float32")
+        vec_blob = vec.tobytes()
+        ts = dt.utcnow().isoformat()
+
         try:
-            self.chroma_client = chromadb.PersistentClient(path=self.chroma_path)
-            self.chroma_collection = self.chroma_client.get_or_create_collection(
-                name="experiences_collection",
-                embedding_function=self.embedding_function # ここでembedding_functionを渡す
-            )
-            if self.debug:
-                print(f"ChromaDB initialized at: {self.chroma_path}")
+            cur.execute("""
+                INSERT INTO experiences
+                (title, title_embedding, content, summary_text,
+                 timestamp, importance, processed)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+            """, (
+                title,
+                sqlite3.Binary(vec_blob),
+                content,
+                summary_text,
+                ts,
+                importance,
+                processed
+            ))
+            exp_id = cur.lastrowid
+            conn.commit()
         except Exception as e:
-            if self.debug:
-                print(f"Error initializing ChromaDB: {e}")
-            raise # ChromaDB初期化に失敗したら例外を再スロー
+            conn.rollback()
+            raise RuntimeError(f"DB insert failed: {e}")
 
-    def init_db(self):
-        """SQLiteデータベースの初期化と接続確立"""
-        if self.connection:
-            self.close_db() # 既存の接続があれば閉じる
-
+        # Update FAISS index
         try:
-            self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
-            self.connection.row_factory = sqlite3.Row # 列名をキーとしてアクセスできるようにする
-            if self.debug:
-                print(f"SQLite database connected at: {self.db_path}")
-            self._initialize_tables() # テーブルの初期化を呼び出す
-        except Exception as e:
-            if self.debug:
-                print(f"Error connecting to SQLite database: {e}")
-            raise # DB接続に失敗したら例外を再スロー
+            if self.index is None:
+                dim = vec.shape[0]
+                self.index = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
+            self.index.add_with_ids(np.array([vec]), np.array([exp_id], dtype="int64"))
+            faiss.write_index(self.index, self.index_file)
+        except Exception:
+            pass
 
+        # Rebuild graph/caches
+        self._build_graph_and_centrality()
+        return exp_id
 
-    def _initialize_tables(self):
-        """SQLiteデータベースのテーブルスキーマ定義と作成"""
-        cursor = self.connection.cursor()
+    def _build_graph_and_centrality(self):
+        """
+        Build an approximate k-NN graph on summary embeddings,
+        compute degree centrality, and cache summary embeddings.
+        """
+        conn = self._get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, summary_text FROM experiences")
+        rows = cur.fetchall()
+        n = len(rows)
+        if n == 0:
+            self.graph = nx.Graph()
+            self.centrality_scores = {}
+            self.summary_embeddings.clear()
+            self.summary_norms.clear()
+            return
 
-        # experiences テーブルの作成
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS experiences (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            content TEXT NOT NULL,
-            source_type TEXT DEFAULT 'chat',
-            metadata TEXT DEFAULT '{}',
-            importance REAL DEFAULT 0.5, -- ★ この行が重要
-            processed BOOLEAN DEFAULT FALSE
-        )
-        """)
+        ids = [r["id"] for r in rows]
+        texts = [r["summary_text"] for r in rows]
+        embs = self.embedder.encode(texts, convert_to_numpy=True).astype("float32")
+        norms = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12)
 
-        # memory_nodes テーブルの作成
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS memory_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            experience_id INTEGER,
-            text TEXT NOT NULL,
-            node_type TEXT DEFAULT 'statement',
-            importance REAL DEFAULT 0.5,
-            access_count INTEGER DEFAULT 0,
-            last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(experience_id) REFERENCES experiences(id)
-        )
-        """)
+        # Cache embeddings and norms
+        self.summary_embeddings = {eid: emb for eid, emb in zip(ids, embs)}
+        self.summary_norms = {eid: norm for eid, norm in zip(ids, norms)}
 
-        # relationships テーブルの作成
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS relationships (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_node_id INTEGER,
-            target_node_id INTEGER,
-            relationship_type TEXT DEFAULT 'semantic',
-            strength REAL DEFAULT 0.5,
-            discovered_method TEXT DEFAULT 'auto',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(source_node_id) REFERENCES memory_nodes(id),
-            FOREIGN KEY(target_node_id) REFERENCES memory_nodes(id),
-            UNIQUE(source_node_id, target_node_id, relationship_type)
-        )
-        """)
-        
-        # sleep_cycles テーブルの作成
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sleep_cycles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            cycle_start DATETIME DEFAULT CURRENT_TIMESTAMP,
-            cycle_end DATETIME,
-            processed_experiences INTEGER,
-            discovered_relationships INTEGER,
-            notes TEXT
-        )
-        """)
+        dim = norms.shape[1]
+        idx_ip = faiss.IndexFlatIP(dim)
+        idx_ip.add(norms)
+        id_map = {i: eid for i, eid in enumerate(ids)}
 
-        self.connection.commit()
+        G = nx.Graph()
+        G.add_nodes_from(ids)
+        k = min(self.graph_nn_k + 1, n)
+        D, I = idx_ip.search(norms, k)
 
-        if self.debug:
-            print("SQLite database tables initialized successfully.")
+        for i in range(n):
+            src = ids[i]
+            for neigh_idx, sim in zip(I[i, 1:], D[i, 1:]):
+                if sim >= self.graph_sim_threshold:
+                    dst = id_map[neigh_idx]
+                    G.add_edge(src, dst)
 
-    def close_db(self):
-        """データベース接続を閉じる"""
-        if self.connection:
-            self.connection.close()
-            self.connection = None
-            if self.debug:
-                print("SQLite database connection closed.")
+        self.graph = G
+        self.centrality_scores = nx.degree_centrality(G)
 
-    def add_experience(self, content: str, source_type: str = 'chat',
-                       metadata: Optional[Dict] = None, importance: float = 0.5) -> Experience:
-        """新しい経験をデータベースに追加し、ChromaDBにも埋め込みを保存"""
-        if metadata is None:
-            metadata = {}
-        
-        # SQLiteへの追加
-        cursor = self.connection.cursor()
-        timestamp = datetime.now().isoformat()
-        cursor.execute(
-            "INSERT INTO experiences (timestamp, content, source_type, metadata, importance) VALUES (?, ?, ?, ?, ?)",
-            (timestamp, content, source_type, json.dumps(metadata), importance)
-        )
-        experience_id = cursor.lastrowid
-        self.connection.commit()
-        
-        # ChromaDBへの追加
+    def extract_context_from_tracker(self, tracker, max_pairs: int) -> list:
+        """Extract last max_pairs of user/bot messages from a Rasa Tracker."""
+        events = tracker.events
+        msgs = []
+        for e in reversed(events):
+            if e.get("event") == "user":
+                msgs.append(f"User: {e.get('text')}")
+            elif e.get("event") == "bot":
+                msgs.append(f"Bot: {e.get('text')}")
+            if len(msgs) >= max_pairs * 2:
+                break
+        return list(reversed(msgs))
+
+    def recall(self, query: str, context_messages: list, top_k: int = 3) -> str:
+        """
+        1. Embed query, FAISS search for candidates.
+        2. Compute context embedding.
+        3. Score candidates by sim, context, recency, importance, freq, centrality.
+        4. Prompt LLM with system instructions + options (0=No recall, 1=Sleep, 2+=titles).
+        5. Parse LLM response robustly, dispatch to NoRecall, Sleep, or normal flow.
+        6. If Sleep, run sleep_cycle and then generate user-facing notice via LLM.
+        """
+        # 1. Query embedding & FAISS search
+        q_vec = self.embedder.encode(query).astype("float32")
+        if self.index is None or (hasattr(self.index, "ntotal") and self.index.ntotal == 0):
+            raise RuntimeError("No experiences available.")
+        distances, ids = self.index.search(np.array([q_vec]), self.faiss_top_k_embed)
+        dists, ids = distances[0], ids[0]
+
+        conn = self._get_connection()
+        cur = conn.cursor()
+
+        # 2. Context embedding
+        max_msgs = self.context_window_pairs * 2
+        rec_msgs = context_messages[-max_msgs:] if len(context_messages) > max_msgs else context_messages
+        ctx_text = "\n".join(rec_msgs)
         try:
-            # EmbeddingFunctionがセットされているか確認
-            if self.chroma_collection and self.embedding_function:
-                # contentからembeddingを直接生成
-                embedding = self.embedding_model.encode([content]).tolist()[0]
-                self.chroma_collection.add(
-                    embeddings=[embedding],
-                    documents=[content],
-                    metadatas=[{"source_type": source_type, "experience_id": experience_id}],
-                    ids=[str(experience_id)] # experience_idをIDとして使用
-                )
-                if self.debug:
-                    print(f"Added experience {experience_id} to ChromaDB.")
+            ctx_vec = self.embedder.encode(ctx_text).astype("float32")
+            ctx_norm = ctx_vec / (np.linalg.norm(ctx_vec) + 1e-12)
+        except Exception:
+            ctx_norm = np.zeros((1,), dtype="float32")
+
+        # 3. Max recall_count for normalization
+        cur.execute("SELECT MAX(recall_count) as max_cnt FROM experiences")
+        row_max = cur.fetchone()
+        max_recall = row_max["max_cnt"] or 1
+
+        candidates = []
+        now = dt.utcnow()
+        for dist, eid in zip(dists, ids):
+            if eid < 0:
+                continue
+            cur.execute("""
+                SELECT title, summary_text, timestamp, importance, recall_count
+                FROM experiences WHERE id = ?
+            """, (int(eid),))
+            row = cur.fetchone()
+            if not row:
+                continue
+            title, summ, ts_str, imp, freq = row
+
+            sim_score = 1.0 / (1.0 + float(dist))
+
+            summary_norm = self.summary_norms.get(eid)
+            if summary_norm is not None and ctx_norm.shape == summary_norm.shape:
+                cos_ctx = float(np.dot(ctx_norm, summary_norm))
+                context_score = max(0.0, min(1.0, cos_ctx))
             else:
-                if self.debug:
-                    print("ChromaDB collection or embedding function not initialized. Skipping ChromaDB add.")
-        except Exception as e:
-            if self.debug:
-                print(f"Error adding experience to ChromaDB: {e}")
-            # エラーが発生してもSQLiteへの追加は成功しているため、例外を再スローしない
+                context_score = 0.0
 
-        return Experience(experience_id, timestamp, content, source_type, metadata, importance, False)
+            try:
+                ts = dt.fromisoformat(ts_str)
+            except Exception:
+                ts = now - datetime.timedelta(days=3650)
+            delta_days = (now - ts).total_seconds() / (3600 * 24)
+            recency_score = np.exp(-delta_days / 1.0)
 
-    def get_experience(self, experience_id: int) -> Optional[Experience]:
-        """IDに基づいて経験を取得"""
-        cursor = self.connection.cursor()
-        cursor.execute("SELECT * FROM experiences WHERE id = ?", (experience_id,))
-        row = cursor.fetchone()
-        if row:
-            return Experience(**row)
-        return None
+            imp_score = min(max((imp - 1.0) / 9.0, 0.0), 1.0)
+            freq_score = np.log1p(freq) / np.log1p(max_recall)
+            centrality_score = float(self.centrality_scores.get(eid, 0.0))
 
-    def recall_relevant_experiences(self, query: str, top_k: int = 5) -> List[Experience]:
-        """クエリに基づいて関連性の高い経験を検索"""
-        if not self.chroma_collection:
-            if self.debug:
-                print("ChromaDB collection not initialized. Cannot recall experiences.")
-            return [] # ChromaDBが初期化されていない場合は空リストを返す
-
-        try:
-            # ChromaDBで類似検索
-            results = self.chroma_collection.query(
-                query_texts=[query],
-                n_results=top_k,
-                include=['metadatas', 'documents', 'distances']
+            w = self.scoring_weights
+            total = (
+                w["sim_score"] * sim_score +
+                w["context_score"] * context_score +
+                w["recency_score"] * recency_score +
+                w["imp_score"] * imp_score +
+                w["freq_score"] * freq_score +
+                w["centrality_score"] * centrality_score
             )
 
-            relevant_experiences = []
-            if results and results['ids'] and results['ids'][0]:
-                experience_ids = [int(id_str) for id_str in results['ids'][0]]
-                # SQLiteから詳細情報を取得
-                placeholders = ','.join('?' * len(experience_ids))
-                cursor = self.connection.cursor()
-                cursor.execute(f"SELECT * FROM experiences WHERE id IN ({placeholders})", experience_ids)
-                
-                # 検索結果の順序をChromaDBの結果に合わせる
-                experiences_map = {exp.id: Experience(**exp) for exp in cursor.fetchall()}
-                for exp_id in experience_ids:
-                    if exp_id in experiences_map:
-                        relevant_experiences.append(experiences_map[exp_id])
-            
-            if self.debug:
-                print(f"Recalled {len(relevant_experiences)} experiences for query: '{query}'")
-            return relevant_experiences
-        except Exception as e:
-            if self.debug:
-                print(f"Error recalling relevant experiences: {e}")
-            return []
+            candidates.append({
+                "id": int(eid),
+                "title": title,
+                "summary": summ,
+                "total_score": total
+            })
 
-    def get_unprocessed_experiences(self) -> List[Experience]:
-        """未処理の経験を取得"""
-        cursor = self.connection.cursor()
-        cursor.execute("SELECT * FROM experiences WHERE processed = FALSE ORDER BY timestamp ASC")
-        return [Experience(**row) for row in cursor.fetchall()]
+        if not candidates:
+            raise RuntimeError("No candidates found.")
 
-    def mark_experience_processed(self, experience_id: int):
-        """経験を処理済みとしてマーク"""
-        cursor = self.connection.cursor()
-        cursor.execute("UPDATE experiences SET processed = TRUE WHERE id = ?", (experience_id,))
-        self.connection.commit()
-        if self.debug:
-            print(f"Marked experience {experience_id} as processed.")
+        candidates.sort(key=lambda x: x["total_score"], reverse=True)
+        top_cands = candidates[:top_k]
 
-    def add_atomic_node(self, experience_id: int, text: str, node_type: str = 'statement',
-                       importance: float = 0.5) -> MemoryNode:
-        """原子ノードをデータベースに追加"""
-        cursor = self.connection.cursor()
-        timestamp = datetime.now().isoformat()
-        cursor.execute(
-            "INSERT INTO memory_nodes (experience_id, text, node_type, importance, last_accessed) VALUES (?, ?, ?, ?, ?)",
-            (experience_id, text, node_type, importance, timestamp)
+        # 4. Build prompt with updated system instruction
+        system_prompt = (
+            "You are an assistant that can retrieve relevant memories from the system as needed, "
+            "and upon user request, select \"Sleep memory for now\" to optimize your memory.\n"
+            "You will be shown a numbered list of options.\n"
+            "Respond with only the single digit corresponding to your choice, without any extra text.\n"
+            "Do not output anything else."
         )
-        node_id = cursor.lastrowid
-        self.connection.commit()
-        if self.debug:
-            print(f"Added atomic node {node_id}: '{text[:30]}...'")
-        return MemoryNode(node_id, experience_id, text, node_type, importance, 0, timestamp)
+        option_lines = [
+            "0. No recall needed",
+            "1. Sleep memory for now"
+        ]
+        for i, c in enumerate(top_cands, start=2):
+            option_lines.append(f"{i}. {c['title']}")
+        option_lines.append(f"User question: {query}")
+        full_prompt = system_prompt + "\n" + "\n".join(option_lines)
 
-    def update_node_access(self, node_id: int):
-        """原子ノードのアクセス回数と最終アクセス日時を更新"""
-        cursor = self.connection.cursor()
-        cursor.execute(
-            "UPDATE memory_nodes SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-            (datetime.now().isoformat(), node_id)
-        )
-        self.connection.commit()
-        if self.debug:
-            print(f"Updated access for node {node_id}.")
+        if not self._llm_callback:
+            raise RuntimeError("LLM callback not set.")
+        raw_resp = self._llm_callback(full_prompt)
 
-    def add_relationship(self, source_node_id: int, target_node_id: int,
-                         relationship_type: str = 'semantic', strength: float = 0.5,
-                         discovered_method: str = 'auto') -> int:
-        """ノード間の関係を追加"""
-        cursor = self.connection.cursor()
-        created_at = datetime.now().isoformat()
-        try:
-            cursor.execute(
-                "INSERT INTO relationships (source_node_id, target_node_id, relationship_type, strength, discovered_method, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (source_node_id, target_node_id, relationship_type, strength, discovered_method, created_at)
+        # 5. Robustly extract the first integer from LLM response
+        m = re.search(r"\d+", raw_resp or "")
+        choice = int(m.group()) if m else 0
+
+        # 6. Dispatch based on choice
+        if choice == 1:
+            # Sleep chosen: run sleep_cycle and then generate notification
+            sleep_result = self.sleep_cycle(llm_summary_fn=self._llm_callback)
+            notify_system_prompt = (
+                "You are the assistant. Inform the user that memory is going to sleep now, "
+                "and that you will improve things in the background."
             )
-            relationship_id = cursor.lastrowid
-            self.connection.commit()
-            if self.debug:
-                print(f"Added relationship {relationship_id} between {source_node_id} and {target_node_id}.")
-            return relationship_id
-        except sqlite3.IntegrityError:
-            if self.debug:
-                print(f"Relationship already exists between {source_node_id} and {target_node_id} with type {relationship_type}. Skipping.")
-            return -1 # 既に存在する関係は追加しない
-        except Exception as e:
-            if self.debug:
-                print(f"Error adding relationship: {e}")
-            raise
+            notify_full = notify_system_prompt + "\nUser request: Please notify me."
+            user_notice = self._llm_callback(notify_full)
+            return user_notice.strip() + "\n" + sleep_result.get("message", "").strip()
 
-    def get_related_nodes(self, node_id: int, relationship_type: Optional[str] = None, limit: int = 10) -> List[MemoryNode]:
-        """特定のノードに関連するノードを取得"""
-        cursor = self.connection.cursor()
-        query = """
-            SELECT mn.* FROM memory_nodes mn
-            JOIN relationships r ON mn.id = r.target_node_id
-            WHERE r.source_node_id = ?
-        """
-        params = [node_id]
-        if relationship_type:
-            query += " AND r.relationship_type = ?"
-            params.append(relationship_type)
-        query += " ORDER BY r.strength DESC LIMIT ?"
-        params.append(limit)
-        
-        cursor.execute(query, tuple(params))
-        return [MemoryNode(**row) for row in cursor.fetchall()]
+        if choice == 0:
+            # No recall: ask LLM using only context
+            no_recall_prompt = f"Recent conversation:\n{ctx_text}\nUser question: {query}\nAnswer:"
+            return self._llm_callback(no_recall_prompt)
 
-    def sleep_cycle(self) -> str:
-        """
-        AIの「スリープサイクル」プロセス。
-        未処理の経験を処理し、原子ノードを生成し、関連を構築する。
-        """
-        if self.debug:
-            print("Starting sleep cycle...")
-        cycle_start = datetime.now().isoformat()
-        
-        unprocessed_experiences = self.get_unprocessed_experiences()
-        processed_count = 0
-        discovered_relationships = 0
+        # 7. Normal recall flow
+        chosen = top_cands[choice - 2]
+        cid = chosen["id"]
+        csum = chosen["summary"]
 
-        if not unprocessed_experiences:
-            report = "処理すべき新しい経験はありませんでした。"
-            self._record_sleep_cycle(cycle_start, datetime.now().isoformat(), 0, 0, report)
-            return report
+        try:
+            cur.execute("UPDATE experiences SET recall_count = recall_count + 1 WHERE id = ?;", (cid,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
 
-        for experience in unprocessed_experiences:
-            if self.debug:
-                print(f"Processing experience {experience.id}: {experience.content[:50]}...")
-            
-            # 1. 経験から原子ノードを抽出（ダミー実装）
-            # 実際にはLLMを使ってテキストを解析し、重要な事実や概念を抽出する
-            nodes_text = self._extract_atomic_nodes_from_experience(experience.content)
-            
-            for node_text in nodes_text:
-                atomic_node = self.add_atomic_node(experience.id, node_text)
-                
-                # 2. 既存のノードとの関連を構築（ダミー実装）
-                # 実際には、新しく生成したノードと、既存の関連性の高いノードを探し、
-                # LLMを使って関係性を推論し、strengthを計算する
-                existing_nodes = self._get_most_recent_nodes(limit=5) # 例として最近のノードをいくつか取得
-                for existing_node in existing_nodes:
-                    if existing_node.id != atomic_node.id:
-                        # ダミーで関係性を追加
-                        self.add_relationship(atomic_node.id, existing_node.id, strength=np.random.rand())
-                        discovered_relationships += 1
-                        self.add_relationship(existing_node.id, atomic_node.id, strength=np.random.rand()) # 双方向
-                        discovered_relationships += 1
-            
-            self.mark_experience_processed(experience.id)
-            processed_count += 1
-            
-        cycle_end = datetime.now().isoformat()
-        report = f"スリープサイクル完了。\n処理済み経験数: {processed_count}\n発見された関係数: {discovered_relationships}"
-        self._record_sleep_cycle(cycle_start, cycle_end, processed_count, discovered_relationships, report)
-        
-        if self.debug:
-            print(f"Sleep cycle finished. Report: {report}")
-        return report
-    
-    def _record_sleep_cycle(self, cycle_start: str, cycle_end: str,
-                           processed_experiences: int, discovered_relationships: int, notes: str):
-        """スリープサイクルの結果を記録"""
-        cursor = self.connection.cursor()
-        cursor.execute(
-            "INSERT INTO sleep_cycles (cycle_start, cycle_end, processed_experiences, discovered_relationships, notes) VALUES (?, ?, ?, ?, ?)",
-            (cycle_start, cycle_end, processed_experiences, discovered_relationships, notes)
+        cur.execute("SELECT id FROM experiences WHERE processed = 1 ORDER BY id")
+        all_ids = [r["id"] for r in cur.fetchall()]
+        pos = all_ids.index(cid) if cid in all_ids else -1
+
+        prev_ids = all_ids[:pos][::-1] if pos >= 0 else []
+        next_ids = all_ids[pos + 1:] if pos >= 0 else []
+
+        MAX_EXTRA = 100
+        rem = MAX_EXTRA
+        extra = ""
+        step = 0
+        pi, ni = 0, 0
+        while rem > 0 and (pi < len(prev_ids) or ni < len(next_ids)):
+            if step % 2 == 0 and pi < len(prev_ids):
+                pid = prev_ids[pi]
+                cur.execute("SELECT summary_text FROM experiences WHERE id = ?", (pid,))
+                text = cur.fetchone()["summary_text"]
+                if len(text) <= rem:
+                    extra = text + extra
+                    rem -= len(text)
+                    pi += 1
+                else:
+                    break
+            elif step % 2 == 1 and ni < len(next_ids):
+                nid = next_ids[ni]
+                cur.execute("SELECT summary_text FROM experiences WHERE id = ?", (nid,))
+                text = cur.fetchone()["summary_text"]
+                if len(text) <= rem:
+                    extra = extra + text
+                    rem -= len(text)
+                    ni += 1
+                else:
+                    break
+            else:
+                if pi < len(prev_ids):
+                    pid = prev_ids[pi]
+                    cur.execute("SELECT summary_text FROM experiences WHERE id = ?", (pid,))
+                    text = cur.fetchone()["summary_text"]
+                    if len(text) <= rem:
+                        extra = text + extra
+                        rem -= len(text)
+                        pi += 1
+                    else:
+                        break
+                elif ni < len(next_ids):
+                    nid = next_ids[ni]
+                    cur.execute("SELECT summary_text FROM experiences WHERE id = ?", (nid,))
+                    text = cur.fetchone()["summary_text"]
+                    if len(text) <= rem:
+                        extra = extra + text
+                        rem -= len(text)
+                        ni += 1
+                    else:
+                        break
+                else:
+                    break
+            step += 1
+
+        final_prompt = (
+            f"Using the following summary information, please answer:\n\n"
+            f"{csum}\n\n{extra}\n\nUser question: {query}\nAnswer:"
         )
-        self.connection.commit()
-        if self.debug:
-            print("Sleep cycle recorded.")
+        return self._llm_callback(final_prompt)
 
-
-    def _extract_atomic_nodes_from_experience(self, content: str) -> List[str]:
+    def sleep_cycle(self, llm_summary_fn=None, rebuild_index: bool = True) -> dict:
         """
-        経験コンテンツから原子ノードを抽出するダミー関数。
-        実際にはLLMを使用する。
+        Perform a sleep cycle:
+        - Cluster recent experiences (within time_window)
+        - Generate summaries for clusters
+        - Save to sleep_history
+        - Optionally rebuild FAISS index
         """
-        # 簡単な例として、文の区切りで分割
-        sentences = [s.strip() for s in content.split('.') if s.strip()]
-        return sentences
-    
-    def _get_most_recent_nodes(self, limit: int = 5) -> List[MemoryNode]:
-        """最近作成されたノードを取得するダミー関数"""
-        cursor = self.connection.cursor()
-        cursor.execute("SELECT * FROM memory_nodes ORDER BY last_accessed DESC LIMIT ?", (limit,))
-        return [MemoryNode(**row) for row in cursor.fetchall()]
+        if llm_summary_fn is None:
+            raise RuntimeError("LLM summary function not set.")
 
-# --- 以下は synapse_studio.py との重複を避けるための参考情報 ---
-# このファイルはsynapse_memoryパッケージとしてpip installされることを想定。
-# そのため、__main__ブロックは通常含まれない。
-# if __name__ == '__main__':
-#     # テストコード
-#     mem = SynapseMemory(debug=True)
-#     exp1 = mem.add_experience("ユーザーがPythonでGUIアプリを開発したいと述べた。", "chat")
-#     exp2 = mem.add_experience("PyQt5とQTextEditを使ってエディタを作る。", "thought")
-    
-#     time.sleep(1) # 時間差をつける
-#     mem.sleep_cycle()
-    
-#     relevant_exp = mem.recall_relevant_experiences("GUI開発について")
-#     print("\n関連経験:")
-#     for exp in relevant_exp:
-#         print(f"- {exp.content}")
-        
-#     mem.close_db()
+        conn = self._get_connection()
+        cur = conn.cursor()
+        window_start_ts = dt.utcnow().timestamp() - self.sleep_time_window
+        window_start_iso = dt.fromtimestamp(window_start_ts).isoformat()
+        cur.execute(
+            "SELECT id, content FROM experiences WHERE timestamp >= ?",
+            (window_start_iso,)
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return {"message": "Sleep Cycle: no recent data.", "latest_sleep_history": None}
+
+        ids = []
+        mats = []
+        for rec_id, content in rows:
+            vec = self.embedder.encode(content).astype("float32")
+            ids.append(int(rec_id))
+            mats.append(vec)
+        data_matrix = np.stack(mats)
+        d = data_matrix.shape[1]
+
+        kmeans = faiss.Kmeans(d, self.sleep_n_clusters, niter=20, verbose=False)
+        kmeans.train(data_matrix)
+        cluster_ids = kmeans.index.search(data_matrix, 1)[1].reshape(-1)
+
+        cluster_map = {}
+        for rec_id, cid in zip(ids, cluster_ids):
+            cluster_map.setdefault(int(cid), []).append(int(rec_id))
+
+        summary_text_for_history = ""
+        for cid, exp_list in cluster_map.items():
+            combined_text = ""
+            for eid in exp_list:
+                cur.execute("SELECT content FROM experiences WHERE id = ?", (eid,))
+                row2 = cur.fetchone()
+                if row2:
+                    combined_text += row2[0] + "\n"
+            summary_prompt = f"Summarize the following exchanges:\n{combined_text}"
+            try:
+                cluster_summary = llm_summary_fn(summary_prompt).strip()
+            except Exception as e:
+                cluster_summary = f"(Summary error: {e})"
+
+            start_ts = dt.utcnow().isoformat()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO sleep_history (cycle_start, cycle_end, original_count, summary_text, notes)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (start_ts, dt.utcnow().isoformat(), len(exp_list), cluster_summary, "")
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+            summary_text_for_history += cluster_summary + "\n"
+
+        message = f"Sleep Cycle: created {self.sleep_n_clusters} clusters and saved summaries."
+        latest = {"original_count": sum(len(v) for v in cluster_map.values()),
+                  "summary_text": summary_text_for_history.strip()}
+
+        if rebuild_index:
+            try:
+                cur.execute("SELECT id, content FROM experiences")
+                all_rows = cur.fetchall()
+                if all_rows:
+                    dim2 = self.embedder.encode(all_rows[0][1]).astype("float32").shape[0]
+                    new_idx = faiss.IndexIDMap(faiss.IndexFlatL2(dim2))
+                    for rec_id, content in all_rows:
+                        vec2 = self.embedder.encode(content).astype("float32")
+                        new_idx.add_with_ids(np.array([vec2]), np.array([int(rec_id)], dtype="int64"))
+                    self.index = new_idx
+                    faiss.write_index(self.index, self.index_file)
+            except Exception:
+                pass
+
+        return {"message": message, "latest_sleep_history": latest}
+
+    def handle_message(self, user_utterance: str, context_messages: list) -> str:
+        """
+        Single entry point for external apps.
+        1. Automatically add the user utterance to memory.
+        2. Run recall (including Sleep or NoRecall).
+        """
+        # Auto-add to memory
+        title = user_utterance[:50]
+        content = user_utterance
+        summary_text = user_utterance
+        try:
+            self.add_experience(title=title, content=content, summary_text=summary_text)
+        except Exception as e:
+            print(f"[SynapseMemory] add_experience error: {e}")
+
+        # Recall / Sleep / NoRecall flow
+        try:
+            return self.recall(query=user_utterance, context_messages=context_messages)
+        except Exception as e:
+            # Fallback: use context only
+            fallback_prompt = f"Recent conversation:\n{''.join(context_messages)}\nUser question: {user_utterance}\nAnswer:"
+            return self._llm_callback(fallback_prompt)
+
+    def set_llm_callback(self, func):
+        """Register an external LLM callback function."""
+        self._llm_callback = func
+
+    def close(self):
+        """Close any resources."""
+        conn = getattr(self._thread_local, "conn", None)
+        if conn:
+            conn.close()
